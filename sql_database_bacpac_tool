@@ -1,0 +1,674 @@
+<#
+.SYNOPSIS
+    GUI Tool for BACPAC Export and Import (Restore) between Azure SQLDB, SQL MI, and SQL Server (IaaS)
+    - Supports Windows Authentication (SQL IAAS) or Azure AD Integrated (Azure SQLDB/MI)
+    - Supports BACPAC storage in Azure Blob Storage (URL+SAS) or local path
+    - Log file is always local, with timing/duration
+.DESCRIPTION
+    Requirements: SQLPackage.exe must be installed and available in PATH
+#>
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$LogFile = Join-Path -Path $PSScriptRoot -ChildPath "SqlBacpacRestoreTool.log"
+
+function Write-Log {
+    param([string]$Message)
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $entry = "$timestamp - $Message"
+    Add-Content -Path $LogFile -Value $entry
+}
+function Write-LogWithDuration {
+    param([string]$Step, [datetime]$StartTime, [datetime]$EndTime, [string]$Result)
+    $duration = New-TimeSpan -Start $StartTime -End $EndTime
+    $msg = "$Step | Start: $($StartTime.ToString('yyyy-MM-dd HH:mm:ss')) | End: $($EndTime.ToString('yyyy-MM-dd HH:mm:ss')) | Duration: $($duration.ToString()) | $Result"
+    Write-Log $msg
+}
+function Show-MessageBox {
+    param($message, $title = "Info")
+    [System.Windows.Forms.MessageBox]::Show($message, $title, [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+}
+function Confirm-OverwriteFile {
+    param($filePath)
+    $question = "File '$filePath' already exists. Do you want to overwrite it?"
+    $result = [System.Windows.Forms.MessageBox]::Show($question, "File Exists", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Warning)
+    return ($result -eq [System.Windows.Forms.DialogResult]::Yes)
+}
+function Get-SqlPackagePath {
+    $defaultPaths = @(
+        "$env:ProgramFiles\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe",
+        "$env:ProgramFiles\Microsoft SQL Server\170\DAC\bin\SqlPackage.exe"
+    )
+    foreach ($path in $defaultPaths) { if (Test-Path $path) { return $path } }
+    $found = Get-Command SqlPackage.exe -ErrorAction SilentlyContinue
+    if ($found) { return $found.Path }
+    Show-MessageBox "SQLPackage.exe not found. Please install it and add it to your PATH." "Error"
+    Write-Log "ERROR: SQLPackage.exe not found."
+    exit 1
+}
+function Test-DatabaseExists {
+    param(
+        [string]$server,
+        [string]$dbName,
+        [string]$targetType
+    )
+    try {
+        # Use appropriate authentication string for master query
+        $connStr = ""
+        if ($targetType -eq "Azure SQLDB" -or $targetType -eq "SQL MI") {
+            $connStr = "Server=tcp:$server,1433;Database=master;Authentication=Active Directory Integrated;"
+        } elseif ($targetType -eq "SQL IAAS") {
+            $connStr = "Server=$server;Database=master;Integrated Security=SSPI;"
+        }
+        $connection = New-Object System.Data.SqlClient.SqlConnection $connStr
+        $connection.Open()
+        $cmd = $connection.CreateCommand()
+        $cmd.CommandText = "SELECT COUNT(*) FROM sys.databases WHERE name = @db"
+        $cmd.Parameters.Add("@db", [System.Data.SqlDbType]::NVarChar, 128) | Out-Null
+        $cmd.Parameters["@db"].Value = $dbName
+        $count = $cmd.ExecuteScalar()
+        $connection.Close()
+        return ($count -gt 0)
+    } catch {
+        Write-Log "ERROR: Unable to check if DB exists: $_"
+        return $false
+    }
+}
+function Drop-Database {
+    param(
+        [string]$server,
+        [string]$dbName,
+        [string]$targetType
+    )
+    try {
+        $connStr = ""
+        if ($targetType -eq "Azure SQLDB" -or $targetType -eq "SQL MI") {
+            $connStr = "Server=tcp:$server,1433;Database=master;Authentication=Active Directory Integrated;"
+        } elseif ($targetType -eq "SQL IAAS") {
+            $connStr = "Server=$server;Database=master;Integrated Security=SSPI;"
+        }
+        $connection = New-Object System.Data.SqlClient.SqlConnection $connStr
+        $connection.Open()
+        $cmd = $connection.CreateCommand()
+        $cmd.CommandText = "ALTER DATABASE [$dbName] SET SINGLE_USER WITH ROLLBACK IMMEDIATE; DROP DATABASE [$dbName];"
+        $cmd.ExecuteNonQuery() | Out-Null
+        $connection.Close()
+        Write-Log "Database '$dbName' dropped from server '$server'."
+        return $true
+    } catch {
+        Write-Log "ERROR: Unable to drop DB: $_"
+        return $false
+    }
+}
+
+function Build-BacpacPath {
+    param($isAzureBlob, $localPath, $blobUrl, $sasToken)
+    if ($isAzureBlob) {
+        $sas = $sasToken.TrimStart("?")
+        if ($blobUrl.Contains("?")) {
+            return $blobUrl
+        }
+        return "$blobUrl`?$sas"
+    } else {
+        return $localPath
+    }
+}
+
+function Export-Bacpac {
+    param (
+        $sourceType, $server, $db, $bacpacPath, $statusBox, $isAzureBlob
+    )
+    $step = "BACPAC Export"
+    $startTime = Get-Date
+    try {
+        if (-not $isAzureBlob -and (Test-Path $bacpacPath)) {
+            if (-not (Confirm-OverwriteFile $bacpacPath)) {
+                Write-Log "${step}: User chose not to overwrite existing BACPAC file $bacpacPath"
+                $statusBox.AppendText("Export cancelled by user (file exists).`r`n")
+                Write-LogWithDuration $step $startTime (Get-Date) "CANCELLED (file exists)"
+                return $false
+            } else {
+                Remove-Item $bacpacPath -Force
+            }
+        }
+        $sqlPackage = Get-SqlPackagePath
+        # Use AD Integrated for Azure SQLDB or MI, Windows Integrated for IAAS
+        $sourceConn = switch ($sourceType) {
+            "Azure SQLDB" { "Server=tcp:$server,1433;Database=$db;Authentication=Active Directory Integrated;Encrypt=true;TrustServerCertificate=false;Connection Timeout=30;" }
+            "SQL MI"      { "Server=tcp:$server,1433;Database=$db;Authentication=Active Directory Integrated;Encrypt=True;TrustServerCertificate=False;" }
+            "SQL IAAS"    { "Server=$server;Database=$db;Integrated Security=True;TrustServerCertificate=True;" }
+        }
+        $diagFile = Join-Path $PSScriptRoot "SqlPackage_export.diaglog"
+        $args = "/Action:Export /SourceConnectionString:`"$sourceConn`" /TargetFile:`"$bacpacPath`" /DiagnosticsFile:`"$diagFile`" /Quiet:False"
+        Write-Log "${step}: Command: $sqlPackage $args"
+        $statusBox.AppendText("Exporting BACPAC from $server/$db ...`r`n")
+        $proc = Start-Process -FilePath $sqlPackage -ArgumentList $args -Wait -NoNewWindow -PassThru -RedirectStandardOutput "$PSScriptRoot\export.log" -RedirectStandardError "$PSScriptRoot\export_error.log"
+        $endTime = Get-Date
+        if ($proc.ExitCode -eq 0) {
+            Write-LogWithDuration $step $startTime $endTime "SUCCESS"
+            $statusBox.AppendText("BACPAC export completed successfully.`r`n")
+            return $true
+        } else {
+            $err = Get-Content "$PSScriptRoot\export_error.log"
+            Write-LogWithDuration $step $startTime $endTime "FAILED: $err"
+            $statusBox.AppendText("BACPAC export failed. See log for details.`r`n")
+            return $false
+        }
+    } catch {
+        $endTime = Get-Date
+        Write-LogWithDuration $step $startTime $endTime "EXCEPTION: $_"
+        $statusBox.AppendText("Exception during export: $_`r`n")
+        return $false
+    }
+}
+
+function Download-BacpacFromBlob {
+    param(
+        [string]$blobUrlWithSas, 
+        [string]$localFile
+    )
+    try {
+        Invoke-WebRequest -Uri $blobUrlWithSas -OutFile $localFile -UseBasicParsing
+        Write-Log "Downloaded Bacpac from Blob to $localFile"
+        return $true
+    } catch {
+        Write-Log "ERROR: Failed to download Bacpac: $_"
+        return $false
+    }
+}
+
+function Import-Bacpac {
+    param (
+        $targetType, $server, $db, $bacpacPath, $statusBox
+    )
+    $step = "BACPAC Import"
+    $startTime = Get-Date
+    try {
+        if ($targetType -eq "SQL IAAS" -or $targetType -eq "SQL MI" -or $targetType -eq "Azure SQLDB") {
+            if (Test-DatabaseExists -server $server -dbName $db -targetType $targetType) {
+                $question = "Target database '$db' exists on '$server'. Drop and restore, or enter new DB name?"
+                $choices = [System.Windows.Forms.MessageBoxButtons]::YesNoCancel
+                $result = [System.Windows.Forms.MessageBox]::Show(
+                    "$question`nYes: Drop & restore`nNo: Cancel`nCancel: Restore as different DB name",
+                    "Database Exists", $choices, [System.Windows.Forms.MessageBoxIcon]::Warning
+                )
+                if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                    $dropStart = Get-Date
+                    if (Drop-Database -server $server -dbName $db -targetType $targetType) {
+                        $dropEnd = Get-Date
+                        Write-LogWithDuration "Drop Database ($db)" $dropStart $dropEnd "SUCCESS"
+                        $statusBox.AppendText("Existing DB dropped, proceeding with restore.`r`n")
+                    } else {
+                        $dropEnd = Get-Date
+                        Write-LogWithDuration "Drop Database ($db)" $dropStart $dropEnd "FAILED"
+                        $statusBox.AppendText("Failed to drop DB. See log.`r`n")
+                        return $false
+                    }
+                } elseif ($result -eq [System.Windows.Forms.DialogResult]::Cancel) {
+                    $inputForm = New-Object System.Windows.Forms.Form
+                    $inputForm.Text = "Enter New DB Name"
+                    $inputForm.Size = New-Object System.Drawing.Size(350,150)
+                    $lbl = New-Object System.Windows.Forms.Label
+                    $lbl.Text = "Enter new target DB name:"
+                    $lbl.Location = New-Object System.Drawing.Point(10,20)
+                    $lbl.Size = New-Object System.Drawing.Size(200,20)
+                    $inputForm.Controls.Add($lbl)
+                    $txt = New-Object System.Windows.Forms.TextBox
+                    $txt.Location = New-Object System.Drawing.Point(10,50)
+                    $txt.Width = 300
+                    $inputForm.Controls.Add($txt)
+                    $okBtn = New-Object System.Windows.Forms.Button
+                    $okBtn.Text = "OK"
+                    $okBtn.Location = New-Object System.Drawing.Point(220,80)
+                    $okBtn.Add_Click({ $inputForm.DialogResult = 'OK'; $inputForm.Close() })
+                    $inputForm.Controls.Add($okBtn)
+                    if ($inputForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                        $db = $txt.Text
+                        $statusBox.AppendText("Restore will use new DB name: $db`r`n")
+                    } else {
+                        $statusBox.AppendText("Restore cancelled by user.`r`n")
+                        Write-LogWithDuration $step $startTime (Get-Date) "CANCELLED (user chose different DB name but cancelled input box)"
+                        return $false
+                    }
+                } else {
+                    $statusBox.AppendText("Restore cancelled by user.`r`n")
+                    Write-LogWithDuration $step $startTime (Get-Date) "CANCELLED by user (DB exists)"
+                    return $false
+                }
+            }
+        }
+        $sqlPackage = Get-SqlPackagePath
+        # Use AD Integrated for Azure SQLDB or MI, Windows Integrated for IAAS
+        $targetConn = switch ($targetType) {
+            "Azure SQLDB" { "Server=tcp:$server,1433;Database=$db;Authentication=Active Directory Integrated;Encrypt=true;TrustServerCertificate=false;Connection Timeout=30;" }
+            "SQL MI"      { "Server=tcp:$server,1433;Database=$db;Authentication=Active Directory Integrated;Encrypt=True;TrustServerCertificate=False;" }
+            "SQL IAAS"    { "Server=$server;Database=$db;Integrated Security=True;TrustServerCertificate=True;" }
+        }
+        $diagFile = Join-Path $PSScriptRoot "SqlPackage_import.diaglog"
+        $args = "/Action:Import /TargetConnectionString:`"$targetConn`" /SourceFile:`"$bacpacPath`" /DiagnosticsFile:`"$diagFile`" /Quiet:False"
+        Write-Log "${step}: Command: $sqlPackage $args"
+        $statusBox.AppendText("Importing BACPAC to $server/$db ...`r`n")
+        $proc = Start-Process -FilePath $sqlPackage -ArgumentList $args -Wait -NoNewWindow -PassThru -RedirectStandardOutput "$PSScriptRoot\import.log" -RedirectStandardError "$PSScriptRoot\import_error.log"
+        $endTime = Get-Date
+        if ($proc.ExitCode -eq 0) {
+            Write-LogWithDuration $step $startTime $endTime "SUCCESS"
+            $statusBox.AppendText("BACPAC import completed successfully.`r`n")
+            return $true
+        } else {
+            $err = Get-Content "$PSScriptRoot\import_error.log"
+            Write-LogWithDuration $step $startTime $endTime "FAILED: $err"
+            $statusBox.AppendText("BACPAC import failed. See log for details.`r`n")
+            return $false
+        }
+    } catch {
+        $endTime = Get-Date
+        Write-LogWithDuration $step $startTime $endTime "EXCEPTION: $_"
+        $statusBox.AppendText("Exception during import: $_`r`n")
+        return $false
+    }
+}
+
+# --- GUI Section ---
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "SQL BACPAC Export & Restore Tool (Azure Blob/Local)"
+$form.Size = New-Object System.Drawing.Size(560,430)
+$form.StartPosition = 'CenterScreen'
+$form.Font = New-Object System.Drawing.Font("Segoe UI",12,[System.Drawing.FontStyle]::Regular)
+
+$label = New-Object System.Windows.Forms.Label
+$label.Text = "Choose an operation:"
+$label.Location = New-Object System.Drawing.Point(30,30)
+$label.Size = New-Object System.Drawing.Size(350,30)
+$form.Controls.Add($label)
+
+$rbBacpacOnly = New-Object System.Windows.Forms.RadioButton
+$rbBacpacOnly.Text = "Bacpac Export Only"
+$rbBacpacOnly.Location = New-Object System.Drawing.Point(55,70)
+$rbBacpacOnly.Size = New-Object System.Drawing.Size(250,30)
+$form.Controls.Add($rbBacpacOnly)
+
+$rbBacpacRestore = New-Object System.Windows.Forms.RadioButton
+$rbBacpacRestore.Text = "Bacpac Export & Restore"
+$rbBacpacRestore.Location = New-Object System.Drawing.Point(55,110)
+$rbBacpacRestore.Size = New-Object System.Drawing.Size(350,30)
+$form.Controls.Add($rbBacpacRestore)
+
+$btnNext = New-Object System.Windows.Forms.Button
+$btnNext.Text = "Next"
+$btnNext.Location = New-Object System.Drawing.Point(420,340)
+$btnNext.Size = New-Object System.Drawing.Size(90,40)
+$form.Controls.Add($btnNext)
+
+$statusBox = New-Object System.Windows.Forms.TextBox
+$statusBox.Multiline = $true
+$statusBox.Location = New-Object System.Drawing.Point(30, 240)
+$statusBox.Size = New-Object System.Drawing.Size(480, 70)
+$statusBox.ReadOnly = $true
+$statusBox.ScrollBars = "Vertical"
+$statusBox.Font = New-Object System.Drawing.Font("Consolas", 11)
+$form.Controls.Add($statusBox)
+
+$logButton = New-Object System.Windows.Forms.Button
+$logButton.Text = "Open Log"
+$logButton.Location = New-Object System.Drawing.Point(30,340)
+$logButton.Size = New-Object System.Drawing.Size(120,40)
+$logButton.Add_Click({
+    Invoke-Item $LogFile
+})
+$form.Controls.Add($logButton)
+
+function Show-BacpacExportForm {
+    $exportForm = New-Object System.Windows.Forms.Form
+    $exportForm.Text = "Bacpac Export Details (Azure Blob/Local)"
+    $exportForm.Size = New-Object System.Drawing.Size(540,430)
+    $exportForm.StartPosition = 'CenterScreen'
+    $exportForm.Font = New-Object System.Drawing.Font("Segoe UI",12)
+
+    $srcTypeLabel = New-Object System.Windows.Forms.Label
+    $srcTypeLabel.Text = "Source SQL Type:"
+    $srcTypeLabel.Location = New-Object System.Drawing.Point(20,30)
+    $srcTypeLabel.Size = New-Object System.Drawing.Size(200,25)
+    $exportForm.Controls.Add($srcTypeLabel)
+
+    $srcTypeCombo = New-Object System.Windows.Forms.ComboBox
+    $srcTypeCombo.Items.AddRange(@("Azure SQLDB","SQL MI","SQL IAAS"))
+    $srcTypeCombo.Location = New-Object System.Drawing.Point(220,30)
+    $srcTypeCombo.Size = New-Object System.Drawing.Size(280,30)
+    $srcTypeCombo.DropDownStyle = 'DropDownList'
+    $srcTypeCombo.SelectedIndex = 2
+    $exportForm.Controls.Add($srcTypeCombo)
+
+    $srcServerLabel = New-Object System.Windows.Forms.Label
+    $srcServerLabel.Text = "Source Server Name:"
+    $srcServerLabel.Location = New-Object System.Drawing.Point(20,70)
+    $srcServerLabel.Size = New-Object System.Drawing.Size(200,25)
+    $exportForm.Controls.Add($srcServerLabel)
+
+    $srcServerText = New-Object System.Windows.Forms.TextBox
+    $srcServerText.Location = New-Object System.Drawing.Point(220,70)
+    $srcServerText.Width = 280
+    $exportForm.Controls.Add($srcServerText)
+
+    $srcDbLabel = New-Object System.Windows.Forms.Label
+    $srcDbLabel.Text = "Source Database Name:"
+    $srcDbLabel.Location = New-Object System.Drawing.Point(20,110)
+    $srcDbLabel.Size = New-Object System.Drawing.Size(200,25)
+    $exportForm.Controls.Add($srcDbLabel)
+
+    $srcDbText = New-Object System.Windows.Forms.TextBox
+    $srcDbText.Location = New-Object System.Drawing.Point(220,110)
+    $srcDbText.Width = 280
+    $exportForm.Controls.Add($srcDbText)
+
+    $bacpacTypeLabel = New-Object System.Windows.Forms.Label
+    $bacpacTypeLabel.Text = "Bacpac Storage:"
+    $bacpacTypeLabel.Location = New-Object System.Drawing.Point(20,150)
+    $bacpacTypeLabel.Size = New-Object System.Drawing.Size(200,25)
+    $exportForm.Controls.Add($bacpacTypeLabel)
+
+    $rbLocal = New-Object System.Windows.Forms.RadioButton
+    $rbLocal.Text = "Local File"
+    $rbLocal.Location = New-Object System.Drawing.Point(220,150)
+    $rbLocal.Size = New-Object System.Drawing.Size(100,25)
+    $rbLocal.Checked = $true
+    $exportForm.Controls.Add($rbLocal)
+
+    $rbBlob = New-Object System.Windows.Forms.RadioButton
+    $rbBlob.Text = "Azure Blob"
+    $rbBlob.Location = New-Object System.Drawing.Point(330,150)
+    $rbBlob.Size = New-Object System.Drawing.Size(120,25)
+    $exportForm.Controls.Add($rbBlob)
+
+    $bacpacLabel = New-Object System.Windows.Forms.Label
+    $bacpacLabel.Text = "Bacpac Path/URL:"
+    $bacpacLabel.Location = New-Object System.Drawing.Point(20,190)
+    $bacpacLabel.Size = New-Object System.Drawing.Size(200,25)
+    $exportForm.Controls.Add($bacpacLabel)
+
+    $bacpacText = New-Object System.Windows.Forms.TextBox
+    $bacpacText.Location = New-Object System.Drawing.Point(220,190)
+    $bacpacText.Width = 200
+    $exportForm.Controls.Add($bacpacText)
+
+    $bacpacBrowse = New-Object System.Windows.Forms.Button
+    $bacpacBrowse.Text = "Browse"
+    $bacpacBrowse.Location = New-Object System.Drawing.Point(430,190)
+    $bacpacBrowse.Size = New-Object System.Drawing.Size(70,30)
+    $bacpacBrowse.Add_Click({
+        $fd = New-Object System.Windows.Forms.SaveFileDialog
+        $fd.Filter = "Bacpac files (*.bacpac)|*.bacpac"
+        if ($fd.ShowDialog() -eq "OK") { $bacpacText.Text = $fd.FileName }
+    })
+    $exportForm.Controls.Add($bacpacBrowse)
+
+    $sasLabel = New-Object System.Windows.Forms.Label
+    $sasLabel.Text = "Azure Blob SAS Token:"
+    $sasLabel.Location = New-Object System.Drawing.Point(20,230)
+    $sasLabel.Size = New-Object System.Drawing.Size(200,25)
+    $sasLabel.Visible = $false
+    $exportForm.Controls.Add($sasLabel)
+
+    $sasText = New-Object System.Windows.Forms.TextBox
+    $sasText.Location = New-Object System.Drawing.Point(220,230)
+    $sasText.Width = 280
+    $sasText.Visible = $false
+    $exportForm.Controls.Add($sasText)
+
+    $statusBox2 = New-Object System.Windows.Forms.TextBox
+    $statusBox2.Multiline = $true
+    $statusBox2.Location = New-Object System.Drawing.Point(20, 270)
+    $statusBox2.Size = New-Object System.Drawing.Size(480, 60)
+    $statusBox2.ReadOnly = $true
+    $statusBox2.ScrollBars = "Vertical"
+    $statusBox2.Font = New-Object System.Drawing.Font("Consolas", 11)
+    $exportForm.Controls.Add($statusBox2)
+
+    $btnExport = New-Object System.Windows.Forms.Button
+    $btnExport.Text = "Export Bacpac"
+    $btnExport.Location = New-Object System.Drawing.Point(370,340)
+    $btnExport.Size = New-Object System.Drawing.Size(130,40)
+    $btnExport.Add_Click({
+        $statusBox2.Clear()
+        $isAzureBlob = $rbBlob.Checked
+        $bacpacPath = Build-BacpacPath -isAzureBlob:$isAzureBlob -localPath:$bacpacText.Text -blobUrl:$bacpacText.Text -sasToken:$sasText.Text
+        $ok = Export-Bacpac -sourceType $srcTypeCombo.Text -server $srcServerText.Text -db $srcDbText.Text -bacpacPath $bacpacPath -statusBox $statusBox2 -isAzureBlob:$isAzureBlob
+        if ($ok) {
+            Show-MessageBox "Bacpac Export Complete!"
+        } else {
+            Show-MessageBox "Bacpac Export Failed. See status/log for details."
+        }
+    })
+    $exportForm.Controls.Add($btnExport)
+
+    $rbLocal.Add_CheckedChanged({
+        if ($rbLocal.Checked) {
+            $bacpacBrowse.Visible = $true
+            $sasLabel.Visible = $false
+            $sasText.Visible = $false
+            $bacpacLabel.Text = "Bacpac File Path:"
+        }
+    })
+    $rbBlob.Add_CheckedChanged({
+        if ($rbBlob.Checked) {
+            $bacpacBrowse.Visible = $false
+            $sasLabel.Visible = $true
+            $sasText.Visible = $true
+            $bacpacLabel.Text = "Bacpac Blob URL:"
+        }
+    })
+
+    $exportForm.ShowDialog()
+}
+
+function Show-BacpacRestoreForm {
+    $restoreForm = New-Object System.Windows.Forms.Form
+    $restoreForm.Text = "Bacpac Export & Restore Details (Azure Blob/Local)"
+    $restoreForm.Size = New-Object System.Drawing.Size(540,520)
+    $restoreForm.StartPosition = 'CenterScreen'
+    $restoreForm.Font = New-Object System.Drawing.Font("Segoe UI",12)
+
+    $srcTypeLabel = New-Object System.Windows.Forms.Label
+    $srcTypeLabel.Text = "Source SQL Type:"
+    $srcTypeLabel.Location = New-Object System.Drawing.Point(20,30)
+    $srcTypeLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($srcTypeLabel)
+
+    $srcTypeCombo = New-Object System.Windows.Forms.ComboBox
+    $srcTypeCombo.Items.AddRange(@("Azure SQLDB","SQL MI","SQL IAAS"))
+    $srcTypeCombo.Location = New-Object System.Drawing.Point(220,30)
+    $srcTypeCombo.Size = New-Object System.Drawing.Size(280,30)
+    $srcTypeCombo.DropDownStyle = 'DropDownList'
+    $srcTypeCombo.SelectedIndex = 2
+    $restoreForm.Controls.Add($srcTypeCombo)
+
+    $srcServerLabel = New-Object System.Windows.Forms.Label
+    $srcServerLabel.Text = "Source Server Name:"
+    $srcServerLabel.Location = New-Object System.Drawing.Point(20,70)
+    $srcServerLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($srcServerLabel)
+
+    $srcServerText = New-Object System.Windows.Forms.TextBox
+    $srcServerText.Location = New-Object System.Drawing.Point(220,70)
+    $srcServerText.Width = 280
+    $restoreForm.Controls.Add($srcServerText)
+
+    $srcDbLabel = New-Object System.Windows.Forms.Label
+    $srcDbLabel.Text = "Source Database Name:"
+    $srcDbLabel.Location = New-Object System.Drawing.Point(20,110)
+    $srcDbLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($srcDbLabel)
+
+    $srcDbText = New-Object System.Windows.Forms.TextBox
+    $srcDbText.Location = New-Object System.Drawing.Point(220,110)
+    $srcDbText.Width = 280
+    $restoreForm.Controls.Add($srcDbText)
+
+    $bacpacTypeLabel = New-Object System.Windows.Forms.Label
+    $bacpacTypeLabel.Text = "Bacpac Storage:"
+    $bacpacTypeLabel.Location = New-Object System.Drawing.Point(20,150)
+    $bacpacTypeLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($bacpacTypeLabel)
+
+    $rbLocal = New-Object System.Windows.Forms.RadioButton
+    $rbLocal.Text = "Local File"
+    $rbLocal.Location = New-Object System.Drawing.Point(220,150)
+    $rbLocal.Size = New-Object System.Drawing.Size(100,25)
+    $rbLocal.Checked = $true
+    $restoreForm.Controls.Add($rbLocal)
+
+    $rbBlob = New-Object System.Windows.Forms.RadioButton
+    $rbBlob.Text = "Azure Blob"
+    $rbBlob.Location = New-Object System.Drawing.Point(330,150)
+    $rbBlob.Size = New-Object System.Drawing.Size(120,25)
+    $restoreForm.Controls.Add($rbBlob)
+
+    $bacpacLabel = New-Object System.Windows.Forms.Label
+    $bacpacLabel.Text = "Bacpac Path/URL:"
+    $bacpacLabel.Location = New-Object System.Drawing.Point(20,190)
+    $bacpacLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($bacpacLabel)
+
+    $bacpacText = New-Object System.Windows.Forms.TextBox
+    $bacpacText.Location = New-Object System.Drawing.Point(220,190)
+    $bacpacText.Width = 200
+    $restoreForm.Controls.Add($bacpacText)
+
+    $bacpacBrowse = New-Object System.Windows.Forms.Button
+    $bacpacBrowse.Text = "Browse"
+    $bacpacBrowse.Location = New-Object System.Drawing.Point(430,190)
+    $bacpacBrowse.Size = New-Object System.Drawing.Size(70,30)
+    $bacpacBrowse.Add_Click({
+        $fd = New-Object System.Windows.Forms.OpenFileDialog
+        $fd.Filter = "Bacpac files (*.bacpac)|*.bacpac"
+        if ($fd.ShowDialog() -eq "OK") { $bacpacText.Text = $fd.FileName }
+    })
+    $restoreForm.Controls.Add($bacpacBrowse)
+
+    $sasLabel = New-Object System.Windows.Forms.Label
+    $sasLabel.Text = "Azure Blob SAS Token:"
+    $sasLabel.Location = New-Object System.Drawing.Point(20,230)
+    $sasLabel.Size = New-Object System.Drawing.Size(200,25)
+    $sasLabel.Visible = $false
+    $restoreForm.Controls.Add($sasLabel)
+
+    $sasText = New-Object System.Windows.Forms.TextBox
+    $sasText.Location = New-Object System.Drawing.Point(220,230)
+    $sasText.Width = 280
+    $sasText.Visible = $false
+    $restoreForm.Controls.Add($sasText)
+
+    $targetTypeLabel = New-Object System.Windows.Forms.Label
+    $targetTypeLabel.Text = "Target SQL Type:"
+    $targetTypeLabel.Location = New-Object System.Drawing.Point(20,270)
+    $targetTypeLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($targetTypeLabel)
+
+    $targetTypeCombo = New-Object System.Windows.Forms.ComboBox
+    $targetTypeCombo.Items.AddRange(@("Azure SQLDB","SQL MI","SQL IAAS"))
+    $targetTypeCombo.Location = New-Object System.Drawing.Point(220,270)
+    $targetTypeCombo.Size = New-Object System.Drawing.Size(280,30)
+    $targetTypeCombo.DropDownStyle = 'DropDownList'
+    $targetTypeCombo.SelectedIndex = 2
+    $restoreForm.Controls.Add($targetTypeCombo)
+
+    $targetServerLabel = New-Object System.Windows.Forms.Label
+    $targetServerLabel.Text = "Target Server Name:"
+    $targetServerLabel.Location = New-Object System.Drawing.Point(20,310)
+    $targetServerLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($targetServerLabel)
+
+    $targetServerText = New-Object System.Windows.Forms.TextBox
+    $targetServerText.Location = New-Object System.Drawing.Point(220,310)
+    $targetServerText.Width = 280
+    $restoreForm.Controls.Add($targetServerText)
+
+    $targetDbLabel = New-Object System.Windows.Forms.Label
+    $targetDbLabel.Text = "Target Database Name:"
+    $targetDbLabel.Location = New-Object System.Drawing.Point(20,350)
+    $targetDbLabel.Size = New-Object System.Drawing.Size(200,25)
+    $restoreForm.Controls.Add($targetDbLabel)
+
+    $targetDbText = New-Object System.Windows.Forms.TextBox
+    $targetDbText.Location = New-Object System.Drawing.Point(220,350)
+    $targetDbText.Width = 280
+    $restoreForm.Controls.Add($targetDbText)
+
+    $statusBox2 = New-Object System.Windows.Forms.TextBox
+    $statusBox2.Multiline = $true
+    $statusBox2.Location = New-Object System.Drawing.Point(20, 390)
+    $statusBox2.Size = New-Object System.Drawing.Size(480, 60)
+    $statusBox2.ReadOnly = $true
+    $statusBox2.ScrollBars = "Vertical"
+    $statusBox2.Font = New-Object System.Drawing.Font("Consolas", 11)
+    $restoreForm.Controls.Add($statusBox2)
+
+    $btnExportRestore = New-Object System.Windows.Forms.Button
+    $btnExportRestore.Text = "Export & Restore"
+    $btnExportRestore.Location = New-Object System.Drawing.Point(370,460)
+    $btnExportRestore.Size = New-Object System.Drawing.Size(130,40)
+    $btnExportRestore.Add_Click({
+        $statusBox2.Clear()
+        $isAzureBlob = $rbBlob.Checked
+        $bacpacPath = Build-BacpacPath -isAzureBlob:$isAzureBlob -localPath:$bacpacText.Text -blobUrl:$bacpacText.Text -sasToken:$sasText.Text
+        $ok = Export-Bacpac -sourceType $srcTypeCombo.Text -server $srcServerText.Text -db $srcDbText.Text -bacpacPath $bacpacPath -statusBox $statusBox2 -isAzureBlob:$isAzureBlob
+        if ($ok) {
+            $localBacpacPath = $bacpacPath
+            if ($isAzureBlob) {
+                $localBacpacPath = Join-Path $env:TEMP ("temp_$(Get-Random).bacpac")
+                $okDownload = Download-BacpacFromBlob -blobUrlWithSas $bacpacPath -localFile $localBacpacPath
+                if (-not $okDownload) {
+                    Show-MessageBox "Failed to download .bacpac from Azure Blob. See log for details."
+                    return
+                }
+            }
+            $ok2 = Import-Bacpac -targetType $targetTypeCombo.Text -server $targetServerText.Text -db $targetDbText.Text -bacpacPath $localBacpacPath -statusBox $statusBox2
+            if ($ok2) {
+                Show-MessageBox "Bacpac Export and Restore Complete!"
+            } else {
+                Show-MessageBox "Restore Failed. See status/log."
+            }
+            if ($isAzureBlob -and (Test-Path $localBacpacPath)) {
+                Remove-Item $localBacpacPath -Force
+            }
+        } else {
+            Show-MessageBox "Export Failed. See status/log."
+        }
+    })
+    $restoreForm.Controls.Add($btnExportRestore)
+
+    $rbLocal.Add_CheckedChanged({
+        if ($rbLocal.Checked) {
+            $bacpacBrowse.Visible = $true
+            $sasLabel.Visible = $false
+            $sasText.Visible = $false
+            $bacpacLabel.Text = "Bacpac File Path:"
+        }
+    })
+    $rbBlob.Add_CheckedChanged({
+        if ($rbBlob.Checked) {
+            $bacpacBrowse.Visible = $false
+            $sasLabel.Visible = $true
+            $sasText.Visible = $true
+            $bacpacLabel.Text = "Bacpac Blob URL:"
+        }
+    })
+
+    $restoreForm.ShowDialog()
+}
+
+$btnNext.Add_Click({
+    $statusBox.Clear()
+    if ($rbBacpacOnly.Checked) {
+        Show-BacpacExportForm
+    }
+    elseif ($rbBacpacRestore.Checked) {
+        Show-BacpacRestoreForm
+    }
+    else {
+        Show-MessageBox "Select an option to proceed."
+    }
+})
+
+[void]$form.ShowDialog()
